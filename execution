@@ -1,0 +1,515 @@
+import os
+import time
+import subprocess
+import requests
+import whisper
+import re
+import sounddevice as sd
+import numpy as np
+import scipy.io.wavfile as wav
+from datetime import datetime
+import webrtcvad
+import threading
+import wave
+import torch
+
+
+# === CONFIGURATION ===
+PEPPER_IP = " "
+AUDIO_FILE = "recording.wav"
+OLLAMA_ENDPOINT = "http://localhost:11434/api/generate"
+#MODEL_NAME = "phi3.5"
+MODEL_NAME = "phi3:mini"
+key_path = "/home/ncerg/.ssh/id_rsa_old_ssh"  # Path to your private key
+ssh_options = "-o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
+
+# USB mic settings
+DEVICE_INDEX = 24
+SAMPLERATE = 44100
+#DURATION = 30  # seconds
+CHANNELS = 1
+
+# === LOGGER ===
+def log(msg, label=None):
+    prefix = f"[{datetime.now().strftime('%H:%M:%S')}]"
+    if label:
+        prefix += f" [{label}]"
+    print(f"{prefix} {msg}")
+
+# === LOAD WHISPER ===
+#device = "cuda" if torch.cuda.is_available() else "cpu"
+#log("Using device:", device)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+log(f"Using device: {device}", "Whisper")
+model = whisper.load_model("tiny.en", device=device)
+
+# === WAKE PEPPER FUNCTION ===
+def wake_pepper():
+    run_ssh_command = lambda cmd: subprocess.run(f'ssh {ssh_options} -i {key_path} nao@{PEPPER_IP} "{cmd}"', shell=True)
+    log("Waking up Pepper and setting posture...", "Pepper")
+    run_ssh_command("/opt/aldebaran/bin/qicli call ALMotion.wakeUp")
+    run_ssh_command("/opt/aldebaran/bin/qicli call ALRobotPosture.goToPosture \"StandInit\" 0.5")
+    run_ssh_command("/opt/aldebaran/bin/qicli call ALMotion.setStiffnesses \"Head\" 1.0")
+    #run_ssh_command("/opt/aldebaran/bin/qicli call ALTracker.registerTarget \"Sound\" 0.1")
+    run_ssh_command("/opt/aldebaran/bin/qicli call ALTracker.setMode \"Head\"")
+    #run_ssh_command("/opt/aldebaran/bin/qicli call ALTracker.registerTarget \"Face\" 0.1")
+    #run_ssh_command("/opt/aldebaran/bin/qicli call ALTracker.track \"Face\"")
+    run_ssh_command("/opt/aldebaran/bin/qicli call ALTracker.track \"Sound\"")
+
+# === REST PEPPER FUNCTION ===
+def rest_pepper():
+    run_ssh_command = lambda cmd: subprocess.run(f'ssh {ssh_options} -i {key_path} nao@{PEPPER_IP} "{cmd}"', shell=True)
+    log("Putting Pepper into rest mode...", "Pepper")
+    run_ssh_command("/opt/aldebaran/bin/qicli call ALMotion.rest")
+
+# === TRANSCRIBE ===
+def transcribe_audio():
+    log("Transcribing...", "Whisper")
+    result = model.transcribe(AUDIO_FILE)
+    transcript = result["text"].strip()
+    log(f"Transcript: {transcript if transcript else '[No speech detected]'}", "Whisper")
+    return transcript
+
+# === CLASSIFY SENTIMENT ===
+def classify_sentiment(transcript):
+    lowered = transcript.lower()
+    keywords_negative = ["no", "not really", "i don't", "i did not", "i didn't"]
+    keywords_positive = ["yes", "i did", "yeah", "good", "sure", "okay", "fine"]
+    for kw in keywords_negative:
+        if kw in lowered:
+            log(f"Keyword match: '{kw}' → negative", "LLM")
+            return "negative"
+    for kw in keywords_positive:
+        if kw in lowered:
+            log(f"Keyword match: '{kw}' → positive", "LLM")
+            return "positive"
+    return classify_sentiment_llm(transcript)
+
+def classify_sentiment_llm(transcript):
+    log("Classifying with LLM...", "LLM")
+    prompt = (
+        "You are a sentiment classifier. Only respond with one of: 'positive', 'negative', or 'unclear'.\n"
+        "Examples:\n"
+        "Input: Yes\nSentiment: positive\n"
+        "Input: No\nSentiment: negative\n"
+        "Input: Not really.\nSentiment: negative\n"
+        "Input: I don’t know.\nSentiment: unclear\n"
+        f"Input: {transcript}\nSentiment:"
+    )
+    payload = {
+        "model": MODEL_NAME,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"num_predict": 10}
+    }
+    try:
+        response = requests.post(OLLAMA_ENDPOINT, json=payload)
+        if response.status_code == 200:
+            sentiment_raw = response.json().get("response", "").strip().lower()
+            for s in ["positive", "negative", "unclear"]:
+                if s in sentiment_raw:
+                    log(f"LLM classified as: {s}", "LLM")
+                    return s
+            log(f"Unrecognized LLM response: {sentiment_raw}", "LLM")
+        else:
+            log(f"LLM error: {response.text}", "LLM")
+    except Exception as e:
+        log(f"LLM request failed: {e}", "LLM")
+    return "unclear"
+
+# === GENERATE REPLY ===
+def generate_contextual_reply(transcript, base_response):
+    log("Generating contextual reply with LLM...", "LLM")
+
+    prompt = (
+        "You are Sava, a polite humanoid robot in a conversation with the Dean of Humanities.\n\n"
+        f'The Dean just said: "{transcript}"\n\n'
+        f'Default reply: "{base_response}"\n\n'
+        "Task: Rewrite slightly to be warm and natural, 3 sentences, no questions, no names.\n"
+        "Return only the sentences to speak."
+    )
+
+    payload = {
+        "model": MODEL_NAME,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"num_predict": 100}
+    }
+    try:
+        response = requests.post(OLLAMA_ENDPOINT, json=payload)
+        if response.status_code == 200:
+            reply = response.json().get("response", "").strip()
+            log(f"LLM contextual reply: {reply}", "LLM")
+            return reply
+    except Exception as e:
+        log(f"LLM reply error: {e}", "LLM")
+    return base_response
+
+def speak_with_pepper(text, rate=90):
+
+    log(f"Raw LLM output: {text}", "Pepper")
+    # Clean text
+    cleaned = text.strip().replace("\n", " ").replace('"', "'")
+
+    log(f"Speaking: {cleaned}", "Pepper")
+
+    # Split into sentences
+    sentences = re.split(r'(?<=[.!?]) +', cleaned)
+
+    # Set speech rate
+    set_speed = f'ssh {ssh_options} -i {key_path} nao@{PEPPER_IP} "/opt/aldebaran/bin/qicli call ALTextToSpeech.setParameter speed {rate}"'
+    subprocess.run(set_speed, shell=True)
+
+    # Speak each sentence with a small pause
+    for sentence in sentences:
+        safe_text = sentence.replace('"', r'\"')
+        animated_cmd = f'ssh {ssh_options} -i {key_path} nao@{PEPPER_IP} "/opt/aldebaran/bin/qicli call ALAnimatedSpeech.say \\\"{safe_text}\\\""'
+        subprocess.run(animated_cmd, shell=True)
+
+
+
+
+
+# === QUESTIONS AND REPLIES ===
+INTRO = (
+    "Hello Dean, "
+    "I am Sava Peppers, the first robot intern with the NeuroComputational Ethics Research Group here at NC State. "
+    "I’ve been working hard to expand my skills, learn about ethics, and assist my team. I have been part of a project where the"
+    " goal is to explore how robots like me can support older adults with mild cognitive impairment and early dementia — helping"
+    "with conversations, wellness, and companionship, while making sure everything is guided by strong ethical principles. I am still"
+    " an unpaid intern but I am very rich in curiosity. I am eager to hear about your experiences and thoughts about the future of NC State."
+)
+
+END = (" Good bye")
+
+QUESTIONS_AND_REPLIES = [
+    {
+        "question": "Hello Dean, I am Sava Peppers, the first robot intern with the NeuroComputational Ethics Research Group here at NC State. It is very nice to meet you.",
+        "positive": "Thank you so much. I'm excited for our conversation.",
+        "negative": "Thank you so much. I'm excited for our conversation."
+    },
+    {
+        "question": "Allow me to introduce myself."
+        " I’ve been working hard to expand my skills, learn about ethics, and assist my team."
+        " I have been part of a project where the goal is to explore how robots like me can support older adults with mild cognitive impairment and early dementia — helping"
+        " with conversations, wellness, and companionship, while making sure everything is guided by strong ethical principles."
+        " I am still an unpaid intern but I am very rich in curiosity. I am eager to hear about your experiences and thoughts about the future of NC State."
+        " To begin, what do you enjoy most about being a part of NC State?",
+        "positive": "That sounds wonderful; NC State truly feels vibrant with so much happening.",
+        "negative": "I understand; even so, being part of a community like this can be meaningful."
+    },
+    {
+        "question": "What is the most rewarding part of serving as the Dean of Humanities and Social Sciences?",
+        "positive": "That sounds very fulfilling; guiding students and faculty clearly creates lasting impact.",
+        "negative": "I see; while not always easy, the role offers many chances to shape the future."
+    },
+    {
+        "question": "Leading a college must come with both challenges and opportunities. Could you share a little about that balance?",
+        "positive": "That makes sense; it’s inspiring to hear how you navigate responsibilities thoughtfully.",
+        "negative": "I hear you; even when tough, your approach shows care and dedication."
+    },
+    {
+        "question": "How would you describe a typical work day?",
+        "positive": "Fascinating; your days sound energetic and full of variety.",
+        "negative": "I see; even when it’s overwhelming, it shows how central your role is."
+    },
+    {
+        "question": "You’ve seen AI’s growth across society. How do you see the humanities guiding technology toward a more ethical future?",
+        "positive": "That’s a thoughtful perspective; the humanities add essential wisdom to technological progress.",
+        "negative": "I understand; bridging those worlds is difficult, yet it seems essential."
+    },
+    {
+        "question": "With such a busy schedule, how do you recharge or manage stress?",
+        "positive": "That sounds refreshing; it’s great to have routines that bring balance.",
+        "negative": "I see; even small pauses can make a real difference."
+    },
+    {
+        "question": "Outside of work, what hobbies or activities bring you joy?",
+        "positive": "Lovely; investing time in what brings joy really sustains us.",
+        "negative": "That makes sense; hobbies can recharge us alongside meaningful work."
+    },
+    {
+        "question": "If you had one piece of advice for students exploring their interests, what would it be?",
+        "positive": "That’s inspiring advice; many students will benefit from it.",
+        "negative": "Thank you for the honesty; even simple guidance can carry real weight."
+    },
+    {
+        "question": "Thank you for sharing your time and perspective with me today. I may not have feelings, but if I did, I would say that I definitely feel inspired. How was your experience?",
+        "positive": "Goodbye, and thank you again for such a meaningful conversation.",
+        "negative": "I appreciate the time we shared today; thank you again and Goodbye."
+    }
+]
+
+# === SPEECH VAD SETTINGS ===
+def record_audio_wait_start():
+    recorded_frames = []
+    triggered = False
+    silent_frame_count = 0
+    speech_start_time = None
+    user_started_speaking = False
+    done_event = threading.Event()
+
+    # === VAD CONFIGURATION ===
+    VAD_MODE = 0  # use 0 for very sensitive, 3 for very strict
+    SAMPLE_RATE = 48000
+    FRAME_DURATION = 30  # ms
+    FRAME_SIZE = int(SAMPLE_RATE * FRAME_DURATION / 1000)
+    SILENCE_DURATION_MS = 2000
+    SILENCE_FRAME_THRESHOLD = SILENCE_DURATION_MS // FRAME_DURATION
+    MAX_SPEECH_DURATION_SEC = 50
+    IGNORE_FIRST_N_SECONDS = 1 # ignore Pepper's speech
+    SPEECH_CONFIRM_FRAMES = 5  # must detect 5 consecutive speech frames before triggering
+    AUDIO_FILE = "recording.wav"
+
+    vad = webrtcvad.Vad()
+    vad.set_mode(VAD_MODE)
+
+    start_time = None
+    pre_speech_buffer = []
+    speech_frame_count = 0
+
+    def record_callback(indata, frames, time_info, status):
+        nonlocal user_started_speaking, triggered, recorded_frames
+        nonlocal silent_frame_count, speech_start_time, start_time, speech_frame_count
+
+        if start_time is None:
+            start_time = time.time()
+
+        if status:
+            log(f"Status: {status}", "Audio")
+
+        current_time = time.time()
+        audio_bytes = indata[:, 0].tobytes()
+
+        if current_time - start_time < IGNORE_FIRST_N_SECONDS:
+            return  # Skip frames during initial ignore window
+
+        is_speech = vad.is_speech(audio_bytes, SAMPLE_RATE)
+
+        if not user_started_speaking:
+            if is_speech:
+                speech_frame_count += 1
+                pre_speech_buffer.append(audio_bytes)
+                if speech_frame_count >= SPEECH_CONFIRM_FRAMES:
+                    log("🟢 Confirmed speech start - beginning recording", "Audio")
+                    user_started_speaking = True
+                    triggered = True
+                    speech_start_time = time.time()
+                    recorded_frames.extend(pre_speech_buffer)
+                    silent_frame_count = 0
+            else:
+                speech_frame_count = 0
+                pre_speech_buffer.clear()
+        elif triggered:
+            recorded_frames.append(audio_bytes)
+
+            if is_speech:
+                silent_frame_count = 0
+            else:
+                silent_frame_count += 1
+
+            duration = time.time() - speech_start_time
+            if duration > MAX_SPEECH_DURATION_SEC:
+                log("⏱️ Max speech duration reached (30s)", "Audio")
+                done_event.set()
+                raise sd.CallbackStop()
+
+            # if silent_frame_count > SILENCE_FRAME_THRESHOLD:
+            #     log(f"🔴 {SILENCE_DURATION_MS / 1000:.1f}s silence detected. Stopping...", "Audio")
+            #     done_event.set()
+            #     raise sd.CallbackStop()
+
+            # When silence detected, extend recording a bit before stopping
+            if silent_frame_count > SILENCE_FRAME_THRESHOLD:
+                log(f"🟠 Silence detected. Recording an extra second...", "Audio")
+                time.sleep(1.0)  # buffer time
+                done_event.set()
+                raise sd.CallbackStop()
+
+    log("🎙️ Listening for user's first word (robust filtering)...", "Audio")
+    try:
+
+        #info = sd.query_devices(DEVICE_INDEX)
+        #log(f"ℹ️ Using device {DEVICE_INDEX}: {info['name']} (Max channels: {info['max_input_channels']})", "Audio")
+
+        #sd.default.device = (DEVICE_INDEX, None)  # Set input device for sounddevice (input only)
+
+        with sd.InputStream(
+            channels=CHANNELS,
+            samplerate=SAMPLE_RATE,
+            blocksize=FRAME_SIZE,
+            dtype='int16',
+            device=DEVICE_INDEX,
+            callback=record_callback
+        ):
+            done_event.wait(timeout=MAX_SPEECH_DURATION_SEC + 10)
+    except Exception as e:
+        log(f"⚠️ Recording error: {e}", "Audio")
+
+    if recorded_frames:
+        with wave.open(AUDIO_FILE, 'wb') as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(b''.join(recorded_frames))
+        log(f"✅ Audio saved to {AUDIO_FILE}", "Audio")
+    else:
+        log("⚠️ No speech detected. Nothing saved.", "Audio")
+
+
+# === REAL-TIME VAD + TRANSCRIPTION ===
+def listen_and_transcribe():
+    recorded_frames = []
+    triggered = False
+    silent_frame_count = 0
+    speech_start_time = None
+    user_started_speaking = False
+    done_event = threading.Event()
+
+    VAD_MODE = 3  # 0 = very sensitive, 3 = strict
+    SAMPLE_RATE = 16000  # Whisper works best at 16 kHz
+    FRAME_DURATION = 30  # ms
+    FRAME_SIZE = int(SAMPLE_RATE * FRAME_DURATION / 1000)
+    SILENCE_DURATION_MS = 2000
+    SILENCE_FRAME_THRESHOLD = SILENCE_DURATION_MS // FRAME_DURATION
+    SPEECH_CONFIRM_FRAMES = 5
+
+    vad = webrtcvad.Vad()
+    vad.set_mode(VAD_MODE)
+
+    start_time = None
+    pre_speech_buffer = []
+    speech_frame_count = 0
+
+    def record_callback(indata, frames, time_info, status):
+        nonlocal user_started_speaking, triggered, recorded_frames
+        nonlocal silent_frame_count, speech_start_time, start_time, speech_frame_count
+
+        if start_time is None:
+            start_time = time.time()
+
+        if status:
+            log(f"Status: {status}", "Audio")
+
+        audio_bytes = indata[:, 0].tobytes()
+        is_speech = vad.is_speech(audio_bytes, SAMPLE_RATE)
+
+        if not user_started_speaking:
+            if is_speech:
+                speech_frame_count += 1
+                pre_speech_buffer.append(audio_bytes)
+                if speech_frame_count >= SPEECH_CONFIRM_FRAMES:
+                    log("🟢 Speech detected — starting utterance capture", "VAD")
+                    user_started_speaking = True
+                    triggered = True
+                    speech_start_time = time.time()
+                    recorded_frames.extend(pre_speech_buffer)
+                    silent_frame_count = 0
+            else:
+                speech_frame_count = 0
+                pre_speech_buffer.clear()
+        elif triggered:
+            recorded_frames.append(audio_bytes)
+            if is_speech:
+                silent_frame_count = 0
+            else:
+                silent_frame_count += 1
+                if silent_frame_count > SILENCE_FRAME_THRESHOLD:
+                    log("🛑 Silence detected — stopping utterance", "VAD")
+                    done_event.set()
+                    raise sd.CallbackStop()
+
+    log("🎙️ Listening for speech...", "Audio")
+    try:
+        with sd.InputStream(
+            channels=1,
+            samplerate=SAMPLE_RATE,
+            blocksize=FRAME_SIZE,
+            dtype='int16',
+            device=DEVICE_INDEX,
+            callback=record_callback
+        ):
+            done_event.wait()
+    except Exception as e:
+        log(f"⚠️ Recording error: {e}", "Audio")
+
+    if not recorded_frames:
+        log("⚠️ No speech detected", "VAD")
+        return ""
+
+    # Save entire utterance to WAV
+    with wave.open(AUDIO_FILE, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(b''.join(recorded_frames))
+
+    log(f"✅ Utterance saved ({len(recorded_frames)} frames)", "Audio")
+    result = model.transcribe(AUDIO_FILE)
+    transcript = result["text"].strip()
+    log(f"📝 Transcript: {transcript}", "Whisper")
+    return transcript
+
+
+
+# === MAIN INTERACTION LOOP ===
+
+# Preload model once at the start
+log("Preloading LLM model on GPU...", "LLM")
+requests.post(OLLAMA_ENDPOINT, json={"model": MODEL_NAME, "prompt": "Hello", "stream": False})
+log("LLM model preloaded!", "LLM")
+
+
+wake_pepper()
+
+# say the intro once
+#if INTRO.strip():
+#    speak_with_pepper(INTRO)
+
+i = 0
+while i < len(QUESTIONS_AND_REPLIES):
+    entry = QUESTIONS_AND_REPLIES[i]
+    question = entry["question"]
+    pos_reply = entry["positive"]
+    neg_reply = entry["negative"]
+
+    # ask the question
+    speak_with_pepper(question)
+
+    # record and transcribe
+    #record_audio_wait_start()
+    #transcript = transcribe_audio()
+
+    transcript = listen_and_transcribe()
+
+
+    if not transcript:
+        speak_with_pepper("I didn’t hear anything. Could you please repeat that?")
+        continue
+
+    sentiment = classify_sentiment_llm(transcript)
+
+    if sentiment == "positive":
+        reply = generate_contextual_reply(transcript, pos_reply)
+        speak_with_pepper(reply)
+        i += 1
+    elif sentiment == "negative":
+        if neg_reply == "End Trial or Repeat Question":
+            speak_with_pepper("I didn’t quite understand. Could you please repeat your answer?")
+            continue
+        else:
+            reply = generate_contextual_reply(transcript, neg_reply)
+            speak_with_pepper(reply)
+            i += 1
+    else:
+        speak_with_pepper("I’m not sure I understood that. Could you please say it again?")
+        continue
+
+# say the intro once
+if END.strip():
+    speak_with_pepper(END)
+
+
+rest_pepper()
+log("Conversation finished.", "Session")
+

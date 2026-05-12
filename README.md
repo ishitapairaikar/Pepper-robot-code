@@ -64,5 +64,3 @@ All processing is local — no cloud dependency, no data leaving the device.
 - Adapt system for diverse populations and cognitive profiles
 - Build immersive VR ethical simulation scenarios (ADC framework)
 
-## License
-MIT License
